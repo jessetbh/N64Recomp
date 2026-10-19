@@ -361,7 +361,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         if (branch_target < func.vram || branch_target >= func_vram_end) {
             // If the branch target is the start of some known function, this can be handled as a tail call.
             // FIXME: how to deal with static functions?
-            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
+            // [wcw fullconv] ...or any address, when unknown jumps are lookup tail calls.
+            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end() ||
+                context.tail_call_unknown_jumps_by_lookup) {
                 fmt::print("Tail call in {} to 0x{:08X}\n", func.name, branch_target);
                 if (!print_func_call_by_address(branch_target, true, true)) {
                     return false;
