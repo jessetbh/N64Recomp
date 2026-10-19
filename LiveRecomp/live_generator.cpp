@@ -1700,6 +1700,20 @@ void N64Recomp::LiveGenerator::emit_check_nan(int fpr, bool is_double) const {
     // Nothing to do here.
 }
 
+// [wcw fullconv] COP0 Random: a cheap pseudo-random value in the register's range (0-31).
+static int64_t live_cop0_random_read() {
+    static uint32_t state = 0x2545F491u;
+    state = state * 1664525u + 1013904223u;
+    return (int64_t)(int32_t)((state >> 16) & 31);
+}
+
+void N64Recomp::LiveGenerator::emit_cop0_random_read(int reg) const {
+    if (reg != 0) {
+        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS0(W), SLJIT_IMM, sljit_sw(live_cop0_random_read));
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_RETURN_REG, 0);
+    }
+}
+
 void N64Recomp::LiveGenerator::emit_cop0_status_read(int reg) const {
     // Skip the read if the target is the zero register.
     if (reg != 0) {

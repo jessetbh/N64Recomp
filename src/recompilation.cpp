@@ -425,6 +425,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 print_indent();
                 generator.emit_cop0_status_read(rt);
                 break;
+            case Cop0Reg::COP0_Random:
+                print_indent();
+                generator.emit_cop0_random_read(rt);
+                break;
             default:
                 fmt::print(stderr, "Unhandled cop0 register in mfc0: {}\n", (int)reg);
                 return false;
