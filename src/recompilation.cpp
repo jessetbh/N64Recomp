@@ -880,6 +880,26 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         }
     }
 
+    // [wcw fullconv] A function that can run off its end (a hack wrote one block of code over two
+    // stock functions) continues at the next address: tail-call it through the lookup.
+    if (context.tail_call_unknown_jumps_by_lookup && func.words.size() >= 2) {
+        auto ends_flow = [](uint32_t w) {
+            uint32_t op = w >> 26;
+            if (op == 0x02) return true;                                    // j
+            if (op == 0x00 && (w & 0x3F) == 0x08) return true;              // jr
+            if (op == 0x04 && ((w >> 16) & 0x3FF) == 0) return true;        // b (beq zero, zero)
+            return false;
+        };
+        uint32_t last = byteswap(func.words[func.words.size() - 1]);
+        uint32_t prev = byteswap(func.words[func.words.size() - 2]);
+        if (!ends_flow(prev) && !ends_flow(last) && last != 0x42000018) {   // not eret either
+            uint32_t next_vram = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
+            fmt::print("[Info] {} runs off its end: tail call to 0x{:08X}\n", func.name, next_vram);
+            generator.emit_function_call_lookup(next_vram);
+            generator.emit_return(context, func_index);
+        }
+    }
+
     // Terminate the function
     generator.emit_function_end();
     
