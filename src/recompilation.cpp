@@ -760,8 +760,19 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     }
 
     if (!handled) {
-        fmt::print(stderr, "Unhandled instruction: {}\n", instr.getOpcodeName());
-        return false;
+        // [wcw fullconv] In hack code (regenerated or relinked), an instruction the R4300 doesn't have is
+        // data or dead code; the hardware would raise a reserved-instruction exception: trap there instead
+        // of rejecting the whole mod.
+        if (context.tail_call_unknown_jumps_by_lookup) {
+            fmt::print("[Info] Unhandled instruction {} at 0x{:08X} in {}: trap\n", instr.getOpcodeName(), instr_vram, func.name);
+            print_indent();
+            generator.emit_do_break(instr_vram);
+            handled = true;
+        }
+        else {
+            fmt::print(stderr, "Unhandled instruction: {}\n", instr.getOpcodeName());
+            return false;
+        }
     }
 
     // TODO is this used?
