@@ -353,6 +353,16 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
                         break;
                     }
                 }
+                // ...or, when unknown jumps are lookup tail calls, in a section whose data the table
+                // was read from (hack code dispatching through an overlay's own switch table).
+                if (!external && context.tail_call_unknown_jumps_by_lookup) {
+                    for (const auto& range : context.jump_table_data_ranges) {
+                        if (jtbl_word >= range[0] && jtbl_word < range[1]) {
+                            external = true;
+                            break;
+                        }
+                    }
+                }
                 // If it's not then this is the end of the jump table
                 if (!external) {
                     break;
@@ -368,6 +378,17 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
         }
 
         //fmt::print("Jtbl at 0x{:08X} (rom 0x{:08X}) with {} entries used by instr at 0x{:08X}\n", cur_jtbl.vram, cur_jtbl.rom, cur_jtbl.entries.size(), cur_jtbl.jr_vram);
+    }
+
+    // [wcw fullconv] A table whose cases all lie outside the function (hack code dispatching through an
+    // overlay's own switch table) is no switch of this function: with unknown jumps as lookup tail calls,
+    // leave the load alone and let the jr be an indirect tail call through the lookup.
+    if (context.tail_call_unknown_jumps_by_lookup) {
+        uint32_t func_end = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
+        std::erase_if(stats.jump_tables, [&](const JumpTable& jtbl) {
+            return std::all_of(jtbl.entries.begin(), jtbl.entries.end(),
+                [&](uint32_t e) { return e < func.vram || e >= func_end; });
+        });
     }
 
     return true;
