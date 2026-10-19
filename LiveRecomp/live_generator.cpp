@@ -1338,6 +1338,15 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
         for (size_t case_index = 0; case_index < cur_labels.size(); case_index++) {
             // Find the label.
             auto find_it = context->labels.find(cur_labels[case_index]);
+            // [wcw fullconv] A case outside the function (see Context::external_code_ranges): emit a
+            // stub after the function body that tail-calls the target through the lookup.
+            if (find_it == context->labels.end() && cur_labels[case_index].starts_with("L_")) {
+                uint32_t target = (uint32_t)std::stoul(cur_labels[case_index].substr(2), nullptr, 16);
+                sljit_label* stub = sljit_emit_label(compiler);
+                emit_function_call_lookup(target);
+                sljit_emit_return_void(compiler);
+                find_it = context->labels.emplace(cur_labels[case_index], stub).first;
+            }
             if (find_it == context->labels.end()) {
                 // Label not found, invalid switch.
                 // Track this in a variable instead of returning immediately so that the pending labels are still cleared.

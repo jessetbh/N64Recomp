@@ -315,13 +315,26 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
         }
 
         // TODO this assumes that the jump table is in the same section as the function itself
-        cur_jtbl.rom = cur_jtbl.vram + func.rom - func.vram;
+        // [wcw fullconv] ...unless Context::jump_table_data_ranges says where it is.
+        auto jtbl_rom_of = [&context, &func](uint32_t addr) -> uint32_t {
+            for (const auto& range : context.jump_table_data_ranges) {
+                if (addr >= range[0] && addr < range[1]) {
+                    return range[2] + (addr - range[0]);
+                }
+            }
+            return addr + func.rom - func.vram;
+        };
+        cur_jtbl.rom = jtbl_rom_of(cur_jtbl.vram);
         cur_jtbl.section_index = func.section_index;
 
         while (vram < end_address) {
             // Retrieve the current entry of the jump table
             // TODO same as above
-            uint32_t rom_addr = vram + func.rom - func.vram;
+            uint32_t rom_addr = jtbl_rom_of(vram);
+            // [wcw fullconv] Stop at the end of the ROM instead of reading past it.
+            if ((size_t)rom_addr + sizeof(uint32_t) > context.rom.size()) {
+                break;
+            }
             uint32_t jtbl_word = byteswap(*reinterpret_cast<const uint32_t*>(&context.rom[rom_addr]));
 
             if (cur_jtbl.got_offset.has_value() && got_ram_addr.has_value()) {
@@ -332,8 +345,18 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
 
             // Check if the entry is a valid address in the current function
             if (jtbl_word < func.vram || jtbl_word >= func.vram + func.words.size() * sizeof(func.words[0])) {
+                // [wcw fullconv] ...or in code a hack added (a case redirected there).
+                bool external = false;
+                for (const auto& [ext_start, ext_end] : context.external_code_ranges) {
+                    if (jtbl_word >= ext_start && jtbl_word < ext_end) {
+                        external = true;
+                        break;
+                    }
+                }
                 // If it's not then this is the end of the jump table
-                break;
+                if (!external) {
+                    break;
+                }
             }
             cur_jtbl.entries.push_back(jtbl_word);
             vram += 4;

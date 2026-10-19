@@ -518,6 +518,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 print_indent();
                 generator.emit_return(context, func_index);
             }
+            // [wcw fullconv] Unknown target: tail call through the lookup when allowed.
+            else if (context.tail_call_unknown_jumps_by_lookup) {
+                if (!print_func_call_by_address(branch_target, true)) {
+                    return false;
+                }
+                print_indent();
+                generator.emit_return(context, func_index);
+            }
             else {
                 fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}\n", func.name, instr_vram, branch_target);
                 return false;
