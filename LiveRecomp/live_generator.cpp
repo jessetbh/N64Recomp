@@ -1315,7 +1315,8 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
     context->function_name = function_name;
     context->func_labels[func_index] = sljit_emit_label(compiler);
     // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
-    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), 0);
+    // [wcw fullconv] one local word: sp saved around calls (emit_save_sp)
+    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), sizeof(sljit_sw));
     sljit_emit_op2(compiler, SLJIT_SUB, Registers::rdram, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
     
     // Check if this function's entry is hooked and emit the hook call if so.
@@ -1385,6 +1386,18 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
         assert(false);
         errored = true;
     }
+}
+
+void N64Recomp::LiveGenerator::emit_save_sp() const {
+    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), 0, Registers::arithmetic_temp1, 0);
+}
+
+void N64Recomp::LiveGenerator::emit_return_if_sp_changed(const Context& context, size_t func_index) const {
+    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
+    sljit_jump* same = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_MEM1(SLJIT_SP), 0);
+    emit_return(context, func_index);
+    sljit_set_label(same, sljit_emit_label(compiler));
 }
 
 void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {

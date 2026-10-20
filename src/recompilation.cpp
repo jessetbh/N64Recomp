@@ -291,12 +291,18 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             return false;
         }
         print_indent();
+        if (context.tail_call_unknown_jumps_by_lookup) {
+            generator.emit_save_sp();
+        }
         generator.emit_function_call_by_register(reg);
+        if (context.tail_call_unknown_jumps_by_lookup) {
+            generator.emit_return_if_sp_changed(context, func_index);
+        }
         print_link_branch();
         return true;
     };
 
-    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch]
+    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, func_index]
         (uint32_t target_func_vram, bool tail_call = false, bool indent = false)
     {
         bool call_by_lookup = false;
@@ -376,6 +382,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 return false;
             }
             print_indent();
+            const bool check_sp = !tail_call && context.tail_call_unknown_jumps_by_lookup;
+            if (check_sp) {
+                generator.emit_save_sp();
+            }
             if (reloc_reference_symbol != (size_t)-1) {
                 generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset);
             }
@@ -387,6 +397,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
             else {
                 generator.emit_function_call(context, matched_func_index);
+            }
+            if (check_sp) {
+                generator.emit_return_if_sp_changed(context, func_index);
             }
             print_link_branch();
         }

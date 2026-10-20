@@ -100,6 +100,8 @@ namespace N64Recomp {
         LiveGeneratorOutput finish();
         // [wcw fullconv] An emit failed since the generator was created (the caller can name the function).
         bool has_errored() const override { return errored; }
+        void emit_save_sp() const override;
+        void emit_return_if_sp_changed(const Context& context, size_t func_index) const override;
         void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const final;
         void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const final;
         void process_store_op(const StoreOp& op, const InstructionContext& ctx) const final;

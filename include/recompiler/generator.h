@@ -29,6 +29,11 @@ namespace N64Recomp {
     public:
         // [wcw fullconv] An emit failed (the live generator); lets the recompiler name the instruction.
         virtual bool has_errored() const { return false; }
+        // [wcw fullconv] Hack code: a callee that pops its caller's frame (a non-local return, Giant Series 64's
+        // decompressor subroutines branch into its epilogue) returned to the caller's caller on the hardware. Around
+        // a call: save sp, and return too when the callee changed it. Only the live generator emits these.
+        virtual void emit_save_sp() const {}
+        virtual void emit_return_if_sp_changed(const Context& context, size_t func_index) const { (void)context; (void)func_index; }
         virtual void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const = 0;
         virtual void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const = 0;
         virtual void process_store_op(const StoreOp& op, const InstructionContext& ctx) const = 0;
@@ -103,6 +108,8 @@ namespace N64Recomp {
         void emit_pause_self() const final;
         void emit_trigger_event(uint32_t event_index) const final;
         void emit_comment(const std::string& comment) const final;
+        void emit_save_sp() const final {}
+        void emit_return_if_sp_changed(const Context&, size_t) const final {}
     private:
         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
