@@ -361,7 +361,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         if (branch_target < func.vram || branch_target >= func_vram_end) {
             // If the branch target is the start of some known function, this can be handled as a tail call.
             // FIXME: how to deal with static functions?
-            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
+            // [wcw fullconv] ...or any address, when unknown jumps are lookup tail calls.
+            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end() ||
+                context.tail_call_unknown_jumps_by_lookup) {
                 fmt::print("Tail call in {} to 0x{:08X}\n", func.name, branch_target);
                 if (!print_func_call_by_address(branch_target, true, true)) {
                     return false;
@@ -422,6 +424,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             case Cop0Reg::COP0_Status:
                 print_indent();
                 generator.emit_cop0_status_read(rt);
+                break;
+            case Cop0Reg::COP0_Random:
+                print_indent();
+                generator.emit_cop0_random_read(rt);
                 break;
             default:
                 fmt::print(stderr, "Unhandled cop0 register in mfc0: {}\n", (int)reg);
@@ -512,6 +518,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             // FIXME: how to deal with static functions?
             else if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
                 fmt::print("[Info] Tail call in {} to 0x{:08X}\n", func.name, branch_target);
+                if (!print_func_call_by_address(branch_target, true)) {
+                    return false;
+                }
+                print_indent();
+                generator.emit_return(context, func_index);
+            }
+            // [wcw fullconv] Unknown target: tail call through the lookup when allowed.
+            else if (context.tail_call_unknown_jumps_by_lookup) {
                 if (!print_func_call_by_address(branch_target, true)) {
                     return false;
                 }
@@ -863,6 +877,26 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             in_likely_delay_slot = is_branch_likely;
             // Advance the vram address by the size of one instruction
             vram += 4;
+        }
+    }
+
+    // [wcw fullconv] A function that can run off its end (a hack wrote one block of code over two
+    // stock functions) continues at the next address: tail-call it through the lookup.
+    if (context.tail_call_unknown_jumps_by_lookup && func.words.size() >= 2) {
+        auto ends_flow = [](uint32_t w) {
+            uint32_t op = w >> 26;
+            if (op == 0x02) return true;                                    // j
+            if (op == 0x00 && (w & 0x3F) == 0x08) return true;              // jr
+            if (op == 0x04 && ((w >> 16) & 0x3FF) == 0) return true;        // b (beq zero, zero)
+            return false;
+        };
+        uint32_t last = byteswap(func.words[func.words.size() - 1]);
+        uint32_t prev = byteswap(func.words[func.words.size() - 2]);
+        if (!ends_flow(prev) && !ends_flow(last) && last != 0x42000018) {   // not eret either
+            uint32_t next_vram = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
+            fmt::print("[Info] {} runs off its end: tail call to 0x{:08X}\n", func.name, next_vram);
+            generator.emit_function_call_lookup(next_vram);
+            generator.emit_return(context, func_index);
         }
     }
 

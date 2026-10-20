@@ -1338,6 +1338,15 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
         for (size_t case_index = 0; case_index < cur_labels.size(); case_index++) {
             // Find the label.
             auto find_it = context->labels.find(cur_labels[case_index]);
+            // [wcw fullconv] A case outside the function (see Context::external_code_ranges): emit a
+            // stub after the function body that tail-calls the target through the lookup.
+            if (find_it == context->labels.end() && cur_labels[case_index].starts_with("L_")) {
+                uint32_t target = (uint32_t)std::stoul(cur_labels[case_index].substr(2), nullptr, 16);
+                sljit_label* stub = sljit_emit_label(compiler);
+                emit_function_call_lookup(target);
+                sljit_emit_return_void(compiler);
+                find_it = context->labels.emplace(cur_labels[case_index], stub).first;
+            }
             if (find_it == context->labels.end()) {
                 // Label not found, invalid switch.
                 // Track this in a variable instead of returning immediately so that the pending labels are still cleared.
@@ -1689,6 +1698,20 @@ void N64Recomp::LiveGenerator::emit_check_nan(int fpr, bool is_double) const {
     (void)fpr;
     (void)is_double;
     // Nothing to do here.
+}
+
+// [wcw fullconv] COP0 Random: a cheap pseudo-random value in the register's range (0-31).
+static int64_t live_cop0_random_read() {
+    static uint32_t state = 0x2545F491u;
+    state = state * 1664525u + 1013904223u;
+    return (int64_t)(int32_t)((state >> 16) & 31);
+}
+
+void N64Recomp::LiveGenerator::emit_cop0_random_read(int reg) const {
+    if (reg != 0) {
+        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS0(W), SLJIT_IMM, sljit_sw(live_cop0_random_read));
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_RETURN_REG, 0);
+    }
 }
 
 void N64Recomp::LiveGenerator::emit_cop0_status_read(int reg) const {

@@ -1,6 +1,7 @@
 #ifndef __RECOMP_PORT__
 #define __RECOMP_PORT__
 
+#include <array>
 #include <span>
 #include <string_view>
 #include <cstdint>
@@ -235,6 +236,15 @@ namespace N64Recomp {
         bool skip_validating_reference_symbols = true;
         // Whether all function calls (excluding reference symbols) should go through lookup.
         bool use_lookup_for_all_function_calls = false;
+        // [wcw fullconv] Treat a jump out of the function to an unknown address as a tail call
+        // through the function lookup (code a ROM hack added or moved is registered at run time).
+        bool tail_call_unknown_jumps_by_lookup = false;
+        // [wcw fullconv] Code ranges outside the context (a hack's added code): jump-table entries
+        // pointing there are kept and become tail calls through the function lookup.
+        std::vector<std::pair<uint32_t, uint32_t>> external_code_ranges;
+        // [wcw fullconv] Where jump tables live in the ROM when it isn't next to the function's own
+        // code (code compiled from a copy): {vram start, vram end, rom of vram start}.
+        std::vector<std::array<uint32_t, 3>> jump_table_data_ranges;
 
         //// Only used by the CLI, TODO move this to a struct in the internal headers.
         // A mapping of function name to index in the functions vector

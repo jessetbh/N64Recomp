@@ -52,6 +52,8 @@ namespace N64Recomp {
         virtual void emit_check_fr(int fpr) const = 0;
         virtual void emit_check_nan(int fpr, bool is_double) const = 0;
         virtual void emit_cop0_status_read(int reg) const = 0;
+        // [wcw fullconv] COP0 Random (ROM hacks use it as a cheap random number).
+        virtual void emit_cop0_random_read(int reg) const = 0;
         virtual void emit_cop0_status_write(int reg) const = 0;
         virtual void emit_cop1_cs_read(int reg) const = 0;
         virtual void emit_cop1_cs_write(int reg) const = 0;
@@ -89,6 +91,7 @@ namespace N64Recomp {
         void emit_check_fr(int fpr) const final;
         void emit_check_nan(int fpr, bool is_double) const final;
         void emit_cop0_status_read(int reg) const final;
+        void emit_cop0_random_read(int reg) const final;
         void emit_cop0_status_write(int reg) const final;
         void emit_cop1_cs_read(int reg) const final;
         void emit_cop1_cs_write(int reg) const final;
