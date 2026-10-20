@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <unordered_map>
 #include <cmath>
@@ -87,6 +88,7 @@ N64Recomp::LiveGenerator::~LiveGenerator() {
 N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
     LiveGeneratorOutput ret{};
     if (errored) {
+        fprintf(stderr, "[live recompiler] not generated: an instruction couldn't be emitted (see the function named above)\n");
         ret.good = false;
         return ret;
     }
@@ -99,6 +101,8 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
 
         // Generation isn't valid if the target function wasn't recompiled.
         if (target_func_label == nullptr) {
+            fprintf(stderr, "[live recompiler] not generated: a call targets function #%zu of this batch, which wasn't recompiled\n",
+                call.target_func_index);
             return { };
         }
 
@@ -149,6 +153,10 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
     // Generate the code.
     ret.code = sljit_generate_code(compiler, 0, NULL);
     ret.code_size = sljit_get_generated_code_size(compiler);
+    if (ret.code == nullptr) {
+        fprintf(stderr, "[live recompiler] not generated: sljit_generate_code failed (error %d)\n", sljit_get_compiler_error(compiler));
+        ret.good = false;
+    }
     ret.functions.resize(context->func_labels.size());
 
     // Get the function addresses.
@@ -1325,6 +1333,10 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
 void N64Recomp::LiveGenerator::emit_function_end() const {
     // Check that all jumps have been paired to a label.
     if (!context->pending_jumps.empty()) {
+        // [wcw fullconv] say which labels were jumped to but never placed
+        for (const auto& [label, jumps] : context->pending_jumps) {
+            fprintf(stderr, "[live recompiler] jump to label %s, which the function never placed\n", label.c_str());
+        }
         assert(false);
         errored = true;
     }
@@ -1348,6 +1360,7 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
                 find_it = context->labels.emplace(cur_labels[case_index], stub).first;
             }
             if (find_it == context->labels.end()) {
+                fprintf(stderr, "[live recompiler] switch %zu: case label %s not found\n", switch_index, cur_labels[case_index].c_str());
                 // Label not found, invalid switch.
                 // Track this in a variable instead of returning immediately so that the pending labels are still cleared.
                 invalid_switch = true;
