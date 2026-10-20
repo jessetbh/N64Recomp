@@ -939,7 +939,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 generator.emit_goto(fmt::format("skip_{}", num_likely_branches));
             }
             // If there are any other branch labels to insert and we're at the next one, insert it
-            if (cur_label != branch_labels.end() && vram >= *cur_label) {
+            // [wcw fullconv] ...all of them: labels below the function (data words in hack code decoding as branches,
+            // tail calls back) are placed here at its start too, and one per instruction delayed every later label
+            // (VPW64 Deluxe's func_80030C5C: its `bne` to the `jr ra` landed four instructions further, in other code)
+            while (cur_label != branch_labels.end() && vram >= *cur_label) {
                 generator.emit_label(fmt::format("L_{:08X}", *cur_label));
                 ++cur_label;
             }
