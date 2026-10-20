@@ -152,10 +152,13 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         uint32_t funct = raw & 0x3F;
         bool shift_imm = (raw >> 26) == 0 && (funct == 0x00 || funct == 0x02 || funct == 0x03 || funct == 0x38 ||
                                               funct == 0x3A || funct == 0x3B || funct == 0x3C || funct == 0x3E || funct == 0x3F);
-        // A jump or branch in the function's last word has its delay slot outside the function: real code never
-        // ends that way (registered hack functions keep their slots), so it's table data (VPW64 Deluxe 0x80030E2C, a
-        // bgezal whose return label would never be placed).
-        bool slotless = instr_index + 1 >= instructions.size() && (instr.isBranch() || instr.isJump());
+        // A linking jump or branch in the function's last word has its delay slot outside the function and a return
+        // label that would never be placed: table data (VPW64 Deluxe 0x80030E2C, a bgezal). A plain branch there is
+        // real code where a stock function split falls in its delay slot (ECW BTBW 0x8011BC3C, func_8011BC40 starts
+        // in the slot): compiled as before.
+        const uint32_t raw_op = raw >> 26, raw_rt = (raw >> 16) & 31;
+        const bool links = raw_op == 3 || (raw_op == 0 && funct == 0x09) || (raw_op == 1 && raw_rt >= 0x10 && raw_rt <= 0x13);
+        bool slotless = instr_index + 1 >= instructions.size() && links;
         // A jump or branch whose delay slot holds another one is undefined on MIPS and never compiled: also table data
         // (VPW64 Deluxe 0x80030CEC, `j` over a table's halfword pairs)
         if (!slotless && (instr.isBranch() || instr.isJump()) && instr_index + 1 < instructions.size()) {
@@ -166,6 +169,18 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             fmt::print("[Info] Jump/branch in the last word (no delay slot) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
             print_indent();
             generator.emit_do_break(instr_vram);
+            return true;
+        }
+        // A copy of ra (`move rd, ra`): calls here don't write ra, so the copy becomes a token for this frame that a
+        // later `jr rd` returns through (VPW64 Deluxe's decompressor). Not in a call's delay slot, where ra is the call's.
+        const uint32_t rs_f = (raw >> 21) & 31, rt_f = (raw >> 16) & 31, rd_f = (raw >> 11) & 31;
+        const bool ra_copy = (raw >> 26) == 0 && (funct == 0x20 || funct == 0x21 || funct == 0x25 || funct == 0x2C || funct == 0x2D) &&
+            ((rs_f == 31 && rt_f == 0) || (rs_f == 0 && rt_f == 31)) && rd_f != 0 && rd_f != 31 && (raw & 0x7C0) == 0;
+        const bool in_call_slot = instr_index > 0 && (instructions[instr_index - 1].getUniqueId() == InstrId::cpu_jal ||
+                                                      instructions[instr_index - 1].getUniqueId() == InstrId::cpu_jalr);
+        if (ra_copy && !in_call_slot) {
+            print_indent();
+            generator.emit_ra_token((int)rd_f);
             return true;
         }
         if (shift_imm && ((raw >> 21) & 31) != 0) {
@@ -386,6 +401,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             if (check_sp) {
                 generator.emit_save_sp();
             }
+            generator.set_tail_call(tail_call);
             if (reloc_reference_symbol != (size_t)-1) {
                 generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset);
             }
@@ -398,6 +414,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             else {
                 generator.emit_function_call(context, matched_func_index);
             }
+            generator.set_tail_call(false);
             if (check_sp) {
                 generator.emit_return_if_sp_changed(context, func_index);
             }
@@ -618,6 +635,20 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
 
             fmt::print("[Info] Indirect tail call in {}\n", func.name);
+            if (context.tail_call_unknown_jumps_by_lookup) {
+                // hack code may return through a copy of ra (a token): check before the lookup
+                if (!process_delay_slot(false)) {
+                    return false;
+                }
+                print_indent();
+                generator.emit_return_if_ra_token(rs, context, func_index);
+                generator.set_tail_call(true);
+                generator.emit_function_call_by_register(rs);
+                generator.set_tail_call(false);
+                print_indent();
+                generator.emit_return(context, func_index);
+                break;
+            }
             print_func_call_by_register(rs);
             print_indent();
             generator.emit_return(context, func_index);
@@ -908,7 +939,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 generator.emit_goto(fmt::format("skip_{}", num_likely_branches));
             }
             // If there are any other branch labels to insert and we're at the next one, insert it
-            if (cur_label != branch_labels.end() && vram >= *cur_label) {
+            // [wcw fullconv] ...all of them: labels below the function (data words in hack code decoding as branches,
+            // tail calls back) are placed here at its start too, and one per instruction delayed every later label
+            // (VPW64 Deluxe's func_80030C5C: its `bne` to the `jr ra` landed four instructions further, in other code)
+            while (cur_label != branch_labels.end() && vram >= *cur_label) {
                 generator.emit_label(fmt::format("L_{:08X}", *cur_label));
                 ++cur_label;
             }

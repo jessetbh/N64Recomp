@@ -102,6 +102,9 @@ namespace N64Recomp {
         bool has_errored() const override { return errored; }
         void emit_save_sp() const override;
         void emit_return_if_sp_changed(const Context& context, size_t func_index) const override;
+        void emit_ra_token(int reg) const override;
+        void set_tail_call(bool tail) const override { tail_call = tail; }
+        void emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const override;
         void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const final;
         void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const final;
         void process_store_op(const StoreOp& op, const InstructionContext& ctx) const final;
@@ -145,6 +148,10 @@ namespace N64Recomp {
         LiveGeneratorInputs inputs;
         mutable std::unique_ptr<LiveGeneratorContext> context;
         mutable bool errored;
+        // [wcw fullconv] set_tail_call, and the function being emitted (its return hook rules a real tail call out)
+        mutable bool tail_call = false;
+        mutable size_t cur_func_index = 0;
+        int call_type() const;
     };
 
     void live_recompiler_init();
