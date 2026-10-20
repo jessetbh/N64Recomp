@@ -497,6 +497,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_cop0_random_read(rt);
                 break;
             default:
+                // [wcw fullconv] hack mode: code a game never runs outside its exception handler / TLB setup (a
+                // stock function the static build stubs, reached by an extra entry): trap there instead of failing
+                if (context.tail_call_unknown_jumps_by_lookup) {
+                    fmt::print("[Info] Unhandled cop0 register in mfc0 ({}) at 0x{:08X} in {}: trap\n", (int)reg, instr_vram, func.name);
+                    print_indent();
+                    generator.emit_do_break(instr_vram);
+                    break;
+                }
                 fmt::print(stderr, "Unhandled cop0 register in mfc0: {}\n", (int)reg);
                 return false;
             }
@@ -511,6 +519,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_cop0_status_write(rt);
                 break;
             default:
+                // [wcw fullconv] hack mode: code a game never runs outside its exception handler / TLB setup (a
+                // stock function the static build stubs, reached by an extra entry): trap there instead of failing
+                if (context.tail_call_unknown_jumps_by_lookup) {
+                    fmt::print("[Info] Unhandled cop0 register in mtc0 ({}) at 0x{:08X} in {}: trap\n", (int)reg, instr_vram, func.name);
+                    print_indent();
+                    generator.emit_do_break(instr_vram);
+                    break;
+                }
                 fmt::print(stderr, "Unhandled cop0 register in mtc0: {}\n", (int)reg);
                 return false;
             }
@@ -844,7 +860,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         // [wcw fullconv] In hack code (regenerated or relinked), an instruction the R4300 doesn't have is
         // data or dead code; the hardware would raise a reserved-instruction exception: trap there instead
         // of rejecting the whole mod.
-        if (context.tail_call_unknown_jumps_by_lookup) {
+        // Cache maintenance (libultra's osInvalICache/osWritebackDCache loops, which static builds stub) has no
+        // effect here: nothing to emit (Revenge Starrcade 2.0 reaches osInvalICache through an extra entry).
+        if (context.tail_call_unknown_jumps_by_lookup && instr_id == InstrId::cpu_cache) {
+            handled = true;
+        }
+        else if (context.tail_call_unknown_jumps_by_lookup) {
             fmt::print("[Info] Unhandled instruction {} at 0x{:08X} in {}: trap\n", instr.getOpcodeName(), instr_vram, func.name);
             print_indent();
             generator.emit_do_break(instr_vram);
