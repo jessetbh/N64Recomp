@@ -98,6 +98,8 @@ namespace N64Recomp {
         LiveGenerator& operator=(LiveGenerator&& rhs) = delete;
 
         LiveGeneratorOutput finish();
+        // [wcw fullconv] An emit failed since the generator was created (the caller can name the function).
+        bool has_errored() const { return errored; }
         void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const final;
         void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const final;
         void process_store_op(const StoreOp& op, const InstructionContext& ctx) const final;

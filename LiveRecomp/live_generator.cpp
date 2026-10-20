@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <unordered_map>
 #include <cmath>
@@ -87,6 +88,7 @@ N64Recomp::LiveGenerator::~LiveGenerator() {
 N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
     LiveGeneratorOutput ret{};
     if (errored) {
+        fprintf(stderr, "[live recompiler] not generated: an instruction couldn't be emitted (see the function named above)\n");
         ret.good = false;
         return ret;
     }
@@ -99,6 +101,8 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
 
         // Generation isn't valid if the target function wasn't recompiled.
         if (target_func_label == nullptr) {
+            fprintf(stderr, "[live recompiler] not generated: a call targets function #%zu of this batch, which wasn't recompiled\n",
+                call.target_func_index);
             return { };
         }
 
@@ -149,6 +153,10 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
     // Generate the code.
     ret.code = sljit_generate_code(compiler, 0, NULL);
     ret.code_size = sljit_get_generated_code_size(compiler);
+    if (ret.code == nullptr) {
+        fprintf(stderr, "[live recompiler] not generated: sljit_generate_code failed (error %d)\n", sljit_get_compiler_error(compiler));
+        ret.good = false;
+    }
     ret.functions.resize(context->func_labels.size());
 
     // Get the function addresses.
