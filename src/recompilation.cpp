@@ -144,6 +144,22 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         generator.emit_comment(fmt::format("0x{:08X}: {}", instr_vram, instr.disassemble(0)));
     }
 
+    // [wcw fullconv] Hack code: a shift-immediate whose rs field isn't zero is no R4300 instruction (data the hack keeps
+    // inside a function, e.g. a byte table); the live generator can't emit some of them (64-bit shifts), so the mod
+    // would fail to load. The hardware would raise a reserved-instruction exception: trap there instead.
+    if (context.tail_call_unknown_jumps_by_lookup) {
+        uint32_t raw = instr.getRaw();
+        uint32_t funct = raw & 0x3F;
+        bool shift_imm = (raw >> 26) == 0 && (funct == 0x00 || funct == 0x02 || funct == 0x03 || funct == 0x38 ||
+                                              funct == 0x3A || funct == 0x3B || funct == 0x3C || funct == 0x3E || funct == 0x3F);
+        if (shift_imm && ((raw >> 21) & 31) != 0) {
+            fmt::print("[Info] Not an instruction (shift with rs set) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
+            print_indent();
+            generator.emit_do_break(instr_vram);
+            return true;
+        }
+    }
+
     // Replace loads for jump table entries into addiu. This leaves the jump table entry's address in the output register
     // instead of the entry's value, which can then be used to determine the offset from the start of the jump table.
     if (jtbl_lw_instructions.contains(instr_vram)) {
