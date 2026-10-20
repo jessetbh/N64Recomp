@@ -152,10 +152,31 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         uint32_t funct = raw & 0x3F;
         bool shift_imm = (raw >> 26) == 0 && (funct == 0x00 || funct == 0x02 || funct == 0x03 || funct == 0x38 ||
                                               funct == 0x3A || funct == 0x3B || funct == 0x3C || funct == 0x3E || funct == 0x3F);
+        // A jump or branch in the function's last word has its delay slot outside the function: real code never
+        // ends that way (registered hack functions keep their slots), so it's table data (VPW64 Deluxe 0x80030E2C, a
+        // bgezal whose return label would never be placed).
+        bool slotless = instr_index + 1 >= instructions.size() && (instr.isBranch() || instr.isJump());
+        // A jump or branch whose delay slot holds another one is undefined on MIPS and never compiled: also table data
+        // (VPW64 Deluxe 0x80030CEC, `j` over a table's halfword pairs)
+        if (!slotless && (instr.isBranch() || instr.isJump()) && instr_index + 1 < instructions.size()) {
+            const auto& slot = instructions[instr_index + 1];
+            slotless = slot.isBranch() || slot.isJump();
+        }
+        if (slotless) {
+            fmt::print("[Info] Jump/branch in the last word (no delay slot) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
+            print_indent();
+            generator.emit_do_break(instr_vram);
+            return true;
+        }
         if (shift_imm && ((raw >> 21) & 31) != 0) {
             fmt::print("[Info] Not an instruction (shift with rs set) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
             print_indent();
             generator.emit_do_break(instr_vram);
+            // in a jal's delay slot the call returns to after_N: place it as the normal path does
+            if (emit_link_branch) {
+                print_indent();
+                generator.emit_label(fmt::format("after_{}", link_branch_index));
+            }
             return true;
         }
     }
@@ -889,6 +910,15 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 fmt::print(stderr, "Error in recompiling {}, clearing output file\n", func.name);
                 output_file.clear();
                 return false;
+            }
+            // [wcw fullconv] Name the instruction a live generator couldn't emit (its error paths are silent).
+            // (the live path calls through Generator, where has_errored is public; CGenerator inherits privately)
+            if constexpr (requires { generator.has_errored(); }) {
+                if (generator.has_errored()) {
+                    fmt::print(stderr, "[live recompiler] couldn't emit 0x{:08X}: {} (0x{:08X}) in {}\n", vram,
+                        instructions[instr_index].disassemble(0), instructions[instr_index].getRaw(), func.name);
+                    return false;
+                }
             }
             // If a link return branch was generated, advance the number of link return branches
             if (had_link_branch) {

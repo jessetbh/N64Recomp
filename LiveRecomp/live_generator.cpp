@@ -1333,6 +1333,10 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
 void N64Recomp::LiveGenerator::emit_function_end() const {
     // Check that all jumps have been paired to a label.
     if (!context->pending_jumps.empty()) {
+        // [wcw fullconv] say which labels were jumped to but never placed
+        for (const auto& [label, jumps] : context->pending_jumps) {
+            fprintf(stderr, "[live recompiler] jump to label %s, which the function never placed\n", label.c_str());
+        }
         assert(false);
         errored = true;
     }
@@ -1356,6 +1360,7 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
                 find_it = context->labels.emplace(cur_labels[case_index], stub).first;
             }
             if (find_it == context->labels.end()) {
+                fprintf(stderr, "[live recompiler] switch %zu: case label %s not found\n", switch_index, cur_labels[case_index].c_str());
                 // Label not found, invalid switch.
                 // Track this in a variable instead of returning immediately so that the pending labels are still cleared.
                 invalid_switch = true;

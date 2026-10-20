@@ -27,6 +27,8 @@ namespace N64Recomp {
 
     class Generator {
     public:
+        // [wcw fullconv] An emit failed (the live generator); lets the recompiler name the instruction.
+        virtual bool has_errored() const { return false; }
         virtual void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const = 0;
         virtual void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const = 0;
         virtual void process_store_op(const StoreOp& op, const InstructionContext& ctx) const = 0;
