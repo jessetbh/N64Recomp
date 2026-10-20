@@ -1311,11 +1311,22 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
     }
 }
 
+// [wcw fullconv] A tail call returns from this function itself (SLJIT_CALL_RETURN), unless its return is hooked.
+int N64Recomp::LiveGenerator::call_type() const {
+    if (tail_call && inputs.return_func_hooks.find(cur_func_index) == inputs.return_func_hooks.end()) {
+        return SLJIT_CALL | SLJIT_CALL_RETURN;
+    }
+    return SLJIT_CALL;
+}
+
 void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_name, size_t func_index) const {
     context->function_name = function_name;
+    cur_func_index = func_index;
+    tail_call = false;
     context->func_labels[func_index] = sljit_emit_label(compiler);
     // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
-    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), 0);
+    // [wcw fullconv] one local word: sp saved around calls (emit_save_sp)
+    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), sizeof(sljit_sw));
     sljit_emit_op2(compiler, SLJIT_SUB, Registers::rdram, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
     
     // Check if this function's entry is hooked and emit the hook call if so.
@@ -1387,6 +1398,66 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
     }
 }
 
+void N64Recomp::LiveGenerator::emit_save_sp() const {
+    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), 0, Registers::arithmetic_temp1, 0);
+}
+
+// [wcw fullconv] Tokens standing for a copy of ra in hack code: 0x7F000000 | slot (a TLB address no game here maps),
+// the slot holding the host frame of the function that made the copy.
+static constexpr uint32_t ra_token_base = 0x7F000000;
+static thread_local void* ra_token_frames[4096];
+static thread_local uint32_t ra_token_next = 0;
+
+static int32_t make_ra_token(void* frame) {
+    uint32_t slot = ra_token_next++ & 4095;
+    ra_token_frames[slot] = frame;
+    return int32_t(ra_token_base | slot);
+}
+
+// A jump to a token: unwind to the frame that made it (none when it's this one) and return.
+static int32_t check_ra_token(uint32_t value, void* frame, recomp_context* ctx) {
+    if ((value & 0xFFFFF000) != ra_token_base) {
+        return 0;
+    }
+    void* target = ra_token_frames[value & 4095];
+    ctx->unwind_frame = target == frame ? nullptr : target;
+    return 1;
+}
+
+void N64Recomp::LiveGenerator::emit_return_if_sp_changed(const Context& context, size_t func_index) const {
+    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
+    sljit_jump* same = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_MEM1(SLJIT_SP), 0);
+    emit_return(context, func_index);
+    sljit_set_label(same, sljit_emit_label(compiler));
+    // a non-local return through a ra token is under way: return; the frame it names stops it
+    sljit_emit_op1(compiler, SLJIT_MOV_P, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, unwind_frame));
+    sljit_jump* none = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_IMM, 0);
+    sljit_get_local_base(compiler, Registers::arithmetic_temp2, 0, 0);
+    sljit_jump* other = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp2, 0);
+    sljit_emit_op1(compiler, SLJIT_MOV_P, SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, unwind_frame), SLJIT_IMM, 0);
+    sljit_set_label(other, sljit_emit_label(compiler));
+    emit_return(context, func_index);
+    sljit_set_label(none, sljit_emit_label(compiler));
+}
+
+void N64Recomp::LiveGenerator::emit_ra_token(int reg) const {
+    sljit_get_local_base(compiler, SLJIT_R0, 0, 0);
+    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS1(32, P), SLJIT_IMM, sljit_sw(make_ra_token));
+    sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_R1, 0, SLJIT_RETURN_REG, 0);
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_R1, 0);
+}
+
+void N64Recomp::LiveGenerator::emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const {
+    sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg));
+    sljit_get_local_base(compiler, SLJIT_R1, 0, 0);
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, Registers::ctx, 0);
+    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3(32, 32, P, P), SLJIT_IMM, sljit_sw(check_ra_token));
+    sljit_jump* plain = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_RETURN_REG, 0, SLJIT_IMM, 0);
+    emit_return(context, func_index);
+    sljit_set_label(plain, sljit_emit_label(compiler));
+}
+
 void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
     // Load the address immediate into the first argument. 
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, int32_t(addr));
@@ -1402,7 +1473,7 @@ void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
 
     // Call the function.
-    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+    sljit_emit_icall(compiler, call_type(), SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
 }
 
 void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
@@ -1420,7 +1491,7 @@ void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
 
     // Call the function.
-    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+    sljit_emit_icall(compiler, call_type(), SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
 }
 
 void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context&, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
@@ -1454,7 +1525,7 @@ void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t functio
     sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
     // Call the function and save the jump to set its label later on.
-    sljit_jump* call_jump = sljit_emit_call(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P));
+    sljit_jump* call_jump = sljit_emit_call(compiler, call_type(), SLJIT_ARGS2V(P, P));
     context->inner_calls.emplace_back(InnerCall{ .target_func_index = function_index, .jump = call_jump });
 }
 

@@ -424,6 +424,8 @@ typedef struct {
     uint32_t* f_odd;
     uint32_t status_reg;
     uint8_t mips3_float_mode;
+    // [wcw fullconv] live-recompiled hack code: the host frame a non-local return through a copy of ra unwinds to
+    void* unwind_frame;
 } recomp_context;
 
 // Checks if the target is an even float register or that mips3 float mode is enabled
