@@ -50,6 +50,8 @@ struct SwitchErrorJump {
     uint32_t instr_vram;
     uint32_t jtbl_vram;
     sljit_jump* jump;
+    // [wcw fullconv] The function the switch is in (a whole batch's error jumps are emitted in finish()).
+    std::string function_name;
 };
 
 struct N64Recomp::LiveGeneratorContext {
@@ -111,11 +113,19 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
 
     // Generate the switch error jump targets and assign the jump labels.
     if (!context->switch_error_jumps.empty()) {
-        // Allocate the function name and place it in the literals.
-        char* func_name = new char[context->function_name.size() + 1];
-        memcpy(func_name, context->function_name.c_str(), context->function_name.size());
-        func_name[context->function_name.size()] = '\x00';
-        ret.string_literals.emplace_back(func_name);
+        // Allocate each function name once and place it in the literals.
+        // [wcw fullconv] Per jump: context->function_name is the batch's last function by now, so every
+        // switch error named that one (aki-roadmap#123).
+        std::unordered_map<std::string, char*> func_names{};
+        auto func_name_of = [&](const std::string& name) {
+            auto [it, added] = func_names.emplace(name, nullptr);
+            if (added) {
+                it->second = new char[name.size() + 1];
+                memcpy(it->second, name.c_str(), name.size() + 1);
+                ret.string_literals.emplace_back(it->second);
+            }
+            return it->second;
+        };
 
         std::vector<sljit_jump*> switch_error_return_jumps{};
         switch_error_return_jumps.resize(context->switch_error_jumps.size());
@@ -128,7 +138,7 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
             sljit_set_label(cur_error_jump.jump, sljit_emit_label(compiler));
 
             // Load the arguments (function name, vram, jump table address)
-            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(func_name));
+            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(func_name_of(cur_error_jump.function_name)));
             sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, sljit_sw(cur_error_jump.instr_vram));
             sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(cur_error_jump.jtbl_vram));
             
@@ -1726,7 +1736,8 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
     
     // Bounds check the addend. If it's greater than or equal to the jump table size (entries * sizeof(u32)) then jump to the switch error.
     sljit_jump* switch_error_jump = sljit_emit_cmp(compiler, SLJIT_GREATER_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_IMM, jtbl.entries.size() * sizeof(uint32_t));
-    context->switch_error_jumps.emplace_back(SwitchErrorJump{.instr_vram = jtbl.jr_vram, .jtbl_vram = jtbl.vram, .jump = switch_error_jump});
+    context->switch_error_jumps.emplace_back(SwitchErrorJump{.instr_vram = jtbl.jr_vram, .jtbl_vram = jtbl.vram, .jump = switch_error_jump,
+        .function_name = context->function_name});
 
     // Multiply the jump table addend by 2 to get the addend for the real jump table. (4 bytes per entry to 8 bytes per entry).
     sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0);
