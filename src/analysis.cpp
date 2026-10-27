@@ -264,6 +264,64 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
     return true;
 }
 
+// [wcw fullconv] The case count a switch's own bounds check allows: `sltiu rT, rI, N` before the
+// `sll addend, rI, 2` that scales the index added to the table address. Searched backwards from that addu, a few
+// instructions at most (the compiler keeps them together); nullopt when the pattern isn't there or a register in it is
+// written in between.
+static std::optional<uint32_t> find_jump_table_bound(const N64Recomp::Function& func, const N64Recomp::JumpTable& jtbl) {
+    constexpr uint32_t max_back = 16;
+    if (jtbl.addu_vram < func.vram) {
+        return std::nullopt;
+    }
+    const size_t addu_index = (jtbl.addu_vram - func.vram) / sizeof(uint32_t);
+    if (addu_index >= func.words.size()) {
+        return std::nullopt;
+    }
+    auto op = [](uint32_t w) { return w >> 26; };
+    auto rs = [](uint32_t w) { return (w >> 21) & 31; };
+    auto rt = [](uint32_t w) { return (w >> 16) & 31; };
+    auto rd = [](uint32_t w) { return (w >> 11) & 31; };
+    auto sa = [](uint32_t w) { return (w >> 6) & 31; };
+    auto funct = [](uint32_t w) { return w & 0x3F; };
+    // the GPR an instruction writes, if any (enough to see a register reused between the guard and the addu)
+    auto written = [&](uint32_t w) -> uint32_t {
+        const uint32_t o = op(w);
+        if (o == 0) {
+            const uint32_t f = funct(w);
+            return (f == 0x08 || f == 0x0C || f == 0x0D || f == 0x0F || (f >= 0x18 && f <= 0x1F) || f == 0x11 || f == 0x13) ? 0 : rd(w);
+        }
+        if (o == 0x03) {
+            return 31;
+        }
+        return ((o >= 0x08 && o <= 0x0F) || (o >= 0x18 && o <= 0x1B) || (o >= 0x20 && o <= 0x27) || o == 0x37) ? rt(w) : 0;
+    };
+    for (size_t i = addu_index; i-- > 0 && addu_index - i <= max_back;) {
+        const uint32_t w = func.words[i];
+        if (written(w) != jtbl.addend_reg) {
+            continue;
+        }
+        if (!(op(w) == 0 && funct(w) == 0 && sa(w) == 2 && rt(w) != 0)) {
+            return std::nullopt;
+        }
+        const uint32_t index_reg = rt(w);
+        for (size_t j = i; j-- > 0 && i - j <= max_back;) {
+            const uint32_t v = func.words[j];
+            if (op(v) == 0x0B && rs(v) == index_reg) {
+                const uint32_t bound = v & 0xFFFF;
+                if (bound == 0 || bound > 0x1000) {
+                    return std::nullopt;
+                }
+                return bound;
+            }
+            if (written(v) == index_reg) {
+                return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Recomp::Function& func,
     const std::vector<rabbitizer::InstructionCpu>& instructions, N64Recomp::FunctionStats& stats) {
     const Section* section = &context.sections[func.section_index];
@@ -327,6 +385,17 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
         cur_jtbl.rom = jtbl_rom_of(cur_jtbl.vram);
         cur_jtbl.section_index = func.section_index;
 
+        // [wcw fullconv] With unknown jumps as lookup tail calls, a table whose bounds check is known holds at least
+        // that many cases, wherever they point: a hack can redirect a case into another function's body
+        // (VPW64 Deluxe, aki-roadmap#123: a case into the middle of another function of the overlay). Ending the
+        // table at such a case cut off the cases after it, and the game reaching one aborted with a switch error.
+        // Entries the scan below accepts anyway still extend the table past the bound, as before, so a guard matched
+        // wrongly never makes a table smaller.
+        std::optional<uint32_t> bound{};
+        if (context.tail_call_unknown_jumps_by_lookup) {
+            bound = find_jump_table_bound(func, cur_jtbl);
+        }
+
         while (vram < end_address) {
             // Retrieve the current entry of the jump table
             // TODO same as above
@@ -364,7 +433,7 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
                     }
                 }
                 // If it's not then this is the end of the jump table
-                if (!external) {
+                if (!external && (!bound.has_value() || cur_jtbl.entries.size() >= bound.value())) {
                     break;
                 }
             }

@@ -939,6 +939,13 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         for (const auto& jtbl : stats.jump_tables) {
             jtbl_lw_instructions.insert(jtbl.lw_vram);
             for (uint32_t jtbl_entry : jtbl.entries) {
+                // [wcw fullconv] In hack mode a case outside the function gets no label: it must reach the live
+                // generator's lookup stub, and a label below the function would be placed at its first instruction
+                // (aki-roadmap#123: case 10 of func_80123674 into func_801211A0 re-entered func_80123674 instead).
+                if (context.tail_call_unknown_jumps_by_lookup &&
+                    (jtbl_entry < func.vram || jtbl_entry >= func.vram + func.words.size() * sizeof(func.words[0]))) {
+                    continue;
+                }
                 branch_labels.insert(jtbl_entry);
             }
         }
