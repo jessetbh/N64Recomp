@@ -238,6 +238,8 @@ namespace N64Recomp {
         bool use_lookup_for_all_function_calls = false;
         // [wcw fullconv] Treat a jump out of the function to an unknown address as a tail call
         // through the function lookup (code a ROM hack added or moved is registered at run time).
+        // Live recompiler only: jump-table cases outside the function become lookup stubs there, which the
+        // C generator doesn't emit.
         bool tail_call_unknown_jumps_by_lookup = false;
         // [wcw fullconv] Code ranges outside the context (a hack's added code): jump-table entries
         // pointing there are kept and become tail calls through the function lookup.

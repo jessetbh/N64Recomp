@@ -1373,7 +1373,7 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
             auto find_it = context->labels.find(cur_labels[case_index]);
             // [wcw fullconv] A case outside the function (see Context::external_code_ranges): emit a
             // stub after the function body that tail-calls the target through the lookup.
-            if (find_it == context->labels.end() && cur_labels[case_index].starts_with("L_")) {
+            if (find_it == context->labels.end() && (cur_labels[case_index].starts_with("L_") || cur_labels[case_index].starts_with("X_"))) {
                 uint32_t target = (uint32_t)std::stoul(cur_labels[case_index].substr(2), nullptr, 16);
                 sljit_label* stub = sljit_emit_label(compiler);
                 emit_function_call_lookup(target);
@@ -1693,8 +1693,15 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
     // Populate the switch's labels.
     std::vector<std::string> cur_labels{};
     cur_labels.resize(jtbl.entries.size());
+    // [wcw fullconv] A case outside the function is named X_ so it always gets the lookup stub in
+    // emit_function_end: an L_ label of the same address (a branch out of the function) may have been placed
+    // at the function's start, and the case would re-enter the function (aki-roadmap#123).
+    const Function& func = recompiler_context.functions[cur_func_index];
+    const uint32_t func_end = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
     for (size_t i = 0; i < cur_labels.size(); i++) {
-        cur_labels[i] = fmt::format("L_{:08X}", jtbl.entries[i]);
+        const bool outside = recompiler_context.tail_call_unknown_jumps_by_lookup &&
+            (jtbl.entries[i] < func.vram || jtbl.entries[i] >= func_end);
+        cur_labels[i] = fmt::format("{}_{:08X}", outside ? "X" : "L", jtbl.entries[i]);
     }
     context->switch_jump_labels.emplace_back(std::move(cur_labels));
 
