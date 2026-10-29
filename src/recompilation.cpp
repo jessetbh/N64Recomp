@@ -900,6 +900,9 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             func.name);
     }
 
+    // [wcw fullconv] Whether a branch or jump table targets the function's last word (see "runs off its end" below).
+    bool last_word_is_label = false;
+
     // Skip analysis and recompilation of this function is stubbed.
     if (!func.stubbed) {
         // Use a set to sort and deduplicate labels
@@ -948,6 +951,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 }
                 branch_labels.insert(jtbl_entry);
             }
+        }
+
+        if (!func.words.empty()) {
+            last_word_is_label = branch_labels.contains(func.vram + (uint32_t)((func.words.size() - 1) * sizeof(func.words[0])));
         }
 
         // Second pass, emit code for each instruction and emit labels
@@ -1024,7 +1031,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         };
         uint32_t last = byteswap(func.words[func.words.size() - 1]);
         uint32_t prev = byteswap(func.words[func.words.size() - 2]);
-        if (!ends_flow(prev) && !ends_flow(last) && last != 0x42000018) {   // not eret either
+        // ...also when a branch lands on the last word: the runtime extends a span that ends on a jump or branch by
+        // its delay slot (aki-roadmap#76), and a branch to that word (the next stock function's start) runs on from it
+        // even when the jump before it ends the flow.
+        if ((last_word_is_label || (!ends_flow(prev) && !ends_flow(last))) && !ends_flow(last) && last != 0x42000018) {   // not eret either
             uint32_t next_vram = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
             fmt::print("[Info] {} runs off its end: tail call to 0x{:08X}\n", func.name, next_vram);
             generator.emit_function_call_lookup(next_vram);
