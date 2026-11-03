@@ -8,6 +8,7 @@
 #include "fmt/format.h"
 #include "fmt/ostream.h"
 
+#include "recompiler/runs_off_end.h"
 #include "recompiler/context.h"
 #include "analysis.h"
 #include "recompiler/operations.h"
@@ -1021,20 +1022,13 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
 
     // [wcw fullconv] A function that can run off its end (a hack wrote one block of code over two
     // stock functions) continues at the next address: tail-call it through the lookup.
-    if (context.tail_call_unknown_jumps_by_lookup && func.words.size() >= 2) {
-        auto ends_flow = [](uint32_t w) {
-            uint32_t op = w >> 26;
-            if (op == 0x02) return true;                                    // j
-            if (op == 0x00 && (w & 0x3F) == 0x08) return true;              // jr
-            if (op == 0x04 && ((w >> 16) & 0x3FF) == 0) return true;        // b (beq zero, zero)
-            return false;
-        };
+    if (context.tail_call_unknown_jumps_by_lookup && !func.words.empty()) {
         uint32_t last = byteswap(func.words[func.words.size() - 1]);
-        uint32_t prev = byteswap(func.words[func.words.size() - 2]);
+        uint32_t prev = func.words.size() >= 2 ? byteswap(func.words[func.words.size() - 2]) : 0;
         // ...also when a branch lands on the last word: the runtime extends a span that ends on a jump or branch by
         // its delay slot (aki-roadmap#76), and a branch to that word (the next stock function's start) runs on from it
         // even when the jump before it ends the flow.
-        if ((last_word_is_label || (!ends_flow(prev) && !ends_flow(last))) && !ends_flow(last) && last != 0x42000018) {   // not eret either
+        if (N64Recomp::function_runs_off_end(func.words.size(), last, prev, last_word_is_label)) {
             uint32_t next_vram = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
             fmt::print("[Info] {} runs off its end: tail call to 0x{:08X}\n", func.name, next_vram);
             generator.emit_function_call_lookup(next_vram);
