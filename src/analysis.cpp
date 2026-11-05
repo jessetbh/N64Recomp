@@ -5,6 +5,7 @@
 #include "fmt/format.h"
 
 #include "recompiler/context.h"
+#include "recompiler/jump_table_bound.h"
 #include "analysis.h"
 
 extern "C" const char* RabbitizerRegister_getNameGpr(uint8_t regValue);
@@ -264,62 +265,13 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
     return true;
 }
 
-// [wcw fullconv] The case count a switch's own bounds check allows: `sltiu rT, rI, N` before the
-// `sll addend, rI, 2` that scales the index added to the table address. Searched backwards from that addu, a few
-// instructions at most (the compiler keeps them together); nullopt when the pattern isn't there or a register in it is
-// written in between.
-static std::optional<uint32_t> find_jump_table_bound(const N64Recomp::Function& func, const N64Recomp::JumpTable& jtbl) {
-    constexpr uint32_t max_back = 16;
+// [wcw fullconv] The bound of a switch, for Function and JumpTable; see recompiler/jump_table_bound.h.
+static std::optional<uint32_t> jump_table_bound_of(const N64Recomp::Function& func, const N64Recomp::JumpTable& jtbl) {
     if (jtbl.addu_vram < func.vram) {
         return std::nullopt;
     }
     const size_t addu_index = (jtbl.addu_vram - func.vram) / sizeof(uint32_t);
-    if (addu_index >= func.words.size()) {
-        return std::nullopt;
-    }
-    auto op = [](uint32_t w) { return w >> 26; };
-    auto rs = [](uint32_t w) { return (w >> 21) & 31; };
-    auto rt = [](uint32_t w) { return (w >> 16) & 31; };
-    auto rd = [](uint32_t w) { return (w >> 11) & 31; };
-    auto sa = [](uint32_t w) { return (w >> 6) & 31; };
-    auto funct = [](uint32_t w) { return w & 0x3F; };
-    // the GPR an instruction writes, if any (enough to see a register reused between the guard and the addu)
-    auto written = [&](uint32_t w) -> uint32_t {
-        const uint32_t o = op(w);
-        if (o == 0) {
-            const uint32_t f = funct(w);
-            return (f == 0x08 || f == 0x0C || f == 0x0D || f == 0x0F || (f >= 0x18 && f <= 0x1F) || f == 0x11 || f == 0x13) ? 0 : rd(w);
-        }
-        if (o == 0x03) {
-            return 31;
-        }
-        return ((o >= 0x08 && o <= 0x0F) || (o >= 0x18 && o <= 0x1B) || (o >= 0x20 && o <= 0x27) || o == 0x37) ? rt(w) : 0;
-    };
-    for (size_t i = addu_index; i-- > 0 && addu_index - i <= max_back;) {
-        const uint32_t w = func.words[i];
-        if (written(w) != jtbl.addend_reg) {
-            continue;
-        }
-        if (!(op(w) == 0 && funct(w) == 0 && sa(w) == 2 && rt(w) != 0)) {
-            return std::nullopt;
-        }
-        const uint32_t index_reg = rt(w);
-        for (size_t j = i; j-- > 0 && i - j <= max_back;) {
-            const uint32_t v = func.words[j];
-            if (op(v) == 0x0B && rs(v) == index_reg) {
-                const uint32_t bound = v & 0xFFFF;
-                if (bound == 0 || bound > 0x1000) {
-                    return std::nullopt;
-                }
-                return bound;
-            }
-            if (written(v) == index_reg) {
-                return std::nullopt;
-            }
-        }
-        return std::nullopt;
-    }
-    return std::nullopt;
+    return N64Recomp::find_jump_table_bound(func.words.data(), func.words.size(), addu_index, jtbl.addend_reg);
 }
 
 bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Recomp::Function& func,
@@ -393,7 +345,7 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
         // wrongly never makes a table smaller.
         std::optional<uint32_t> bound{};
         if (context.tail_call_unknown_jumps_by_lookup) {
-            bound = find_jump_table_bound(func, cur_jtbl);
+            bound = jump_table_bound_of(func, cur_jtbl);
         }
 
         while (vram < end_address) {
