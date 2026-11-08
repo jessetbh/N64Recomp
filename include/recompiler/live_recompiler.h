@@ -98,6 +98,13 @@ namespace N64Recomp {
         LiveGenerator& operator=(LiveGenerator&& rhs) = delete;
 
         LiveGeneratorOutput finish();
+        // [wcw fullconv] An emit failed since the generator was created (the caller can name the function).
+        bool has_errored() const override { return errored; }
+        void emit_save_sp() const override;
+        void emit_return_if_sp_changed(const Context& context, size_t func_index) const override;
+        void emit_ra_token(int reg) const override;
+        void set_tail_call(bool tail) const override { tail_call = tail; }
+        void emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const override;
         void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const final;
         void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const final;
         void process_store_op(const StoreOp& op, const InstructionContext& ctx) const final;
@@ -121,6 +128,7 @@ namespace N64Recomp {
         void emit_check_fr(int fpr) const final;
         void emit_check_nan(int fpr, bool is_double) const final;
         void emit_cop0_status_read(int reg) const final;
+        void emit_cop0_random_read(int reg) const final;
         void emit_cop0_status_write(int reg) const final;
         void emit_cop1_cs_read(int reg) const final;
         void emit_cop1_cs_write(int reg) const final;
@@ -140,6 +148,10 @@ namespace N64Recomp {
         LiveGeneratorInputs inputs;
         mutable std::unique_ptr<LiveGeneratorContext> context;
         mutable bool errored;
+        // [wcw fullconv] set_tail_call, and the function being emitted (its return hook rules a real tail call out)
+        mutable bool tail_call = false;
+        mutable size_t cur_func_index = 0;
+        int call_type() const;
     };
 
     void live_recompiler_init();

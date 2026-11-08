@@ -8,6 +8,7 @@
 #include "fmt/format.h"
 #include "fmt/ostream.h"
 
+#include "recompiler/runs_off_end.h"
 #include "recompiler/context.h"
 #include "analysis.h"
 #include "recompiler/operations.h"
@@ -144,6 +145,58 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         generator.emit_comment(fmt::format("0x{:08X}: {}", instr_vram, instr.disassemble(0)));
     }
 
+    // [wcw fullconv] Hack code: a shift-immediate whose rs field isn't zero is no R4300 instruction (data the hack keeps
+    // inside a function, e.g. a byte table); the live generator can't emit some of them (64-bit shifts), so the mod
+    // would fail to load. The hardware would raise a reserved-instruction exception: trap there instead.
+    if (context.tail_call_unknown_jumps_by_lookup) {
+        uint32_t raw = instr.getRaw();
+        uint32_t funct = raw & 0x3F;
+        bool shift_imm = (raw >> 26) == 0 && (funct == 0x00 || funct == 0x02 || funct == 0x03 || funct == 0x38 ||
+                                              funct == 0x3A || funct == 0x3B || funct == 0x3C || funct == 0x3E || funct == 0x3F);
+        // A linking jump or branch in the function's last word has its delay slot outside the function and a return
+        // label that would never be placed: table data (VPW64 Deluxe 0x80030E2C, a bgezal). A plain branch there is
+        // real code where a stock function split falls in its delay slot (ECW BTBW 0x8011BC3C, func_8011BC40 starts
+        // in the slot): compiled as before.
+        const uint32_t raw_op = raw >> 26, raw_rt = (raw >> 16) & 31;
+        const bool links = raw_op == 3 || (raw_op == 0 && funct == 0x09) || (raw_op == 1 && raw_rt >= 0x10 && raw_rt <= 0x13);
+        bool slotless = instr_index + 1 >= instructions.size() && links;
+        // A jump or branch whose delay slot holds another one is undefined on MIPS and never compiled: also table data
+        // (VPW64 Deluxe 0x80030CEC, `j` over a table's halfword pairs)
+        if (!slotless && (instr.isBranch() || instr.isJump()) && instr_index + 1 < instructions.size()) {
+            const auto& slot = instructions[instr_index + 1];
+            slotless = slot.isBranch() || slot.isJump();
+        }
+        if (slotless) {
+            fmt::print("[Info] Jump/branch in the last word (no delay slot) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
+            print_indent();
+            generator.emit_do_break(instr_vram);
+            return true;
+        }
+        // A copy of ra (`move rd, ra`): calls here don't write ra, so the copy becomes a token for this frame that a
+        // later `jr rd` returns through (VPW64 Deluxe's decompressor). Not in a call's delay slot, where ra is the call's.
+        const uint32_t rs_f = (raw >> 21) & 31, rt_f = (raw >> 16) & 31, rd_f = (raw >> 11) & 31;
+        const bool ra_copy = (raw >> 26) == 0 && (funct == 0x20 || funct == 0x21 || funct == 0x25 || funct == 0x2C || funct == 0x2D) &&
+            ((rs_f == 31 && rt_f == 0) || (rs_f == 0 && rt_f == 31)) && rd_f != 0 && rd_f != 31 && (raw & 0x7C0) == 0;
+        const bool in_call_slot = instr_index > 0 && (instructions[instr_index - 1].getUniqueId() == InstrId::cpu_jal ||
+                                                      instructions[instr_index - 1].getUniqueId() == InstrId::cpu_jalr);
+        if (ra_copy && !in_call_slot) {
+            print_indent();
+            generator.emit_ra_token((int)rd_f);
+            return true;
+        }
+        if (shift_imm && ((raw >> 21) & 31) != 0) {
+            fmt::print("[Info] Not an instruction (shift with rs set) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
+            print_indent();
+            generator.emit_do_break(instr_vram);
+            // in a jal's delay slot the call returns to after_N: place it as the normal path does
+            if (emit_link_branch) {
+                print_indent();
+                generator.emit_label(fmt::format("after_{}", link_branch_index));
+            }
+            return true;
+        }
+    }
+
     // Replace loads for jump table entries into addiu. This leaves the jump table entry's address in the output register
     // instead of the entry's value, which can then be used to determine the offset from the start of the jump table.
     if (jtbl_lw_instructions.contains(instr_vram)) {
@@ -254,12 +307,18 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             return false;
         }
         print_indent();
+        if (context.tail_call_unknown_jumps_by_lookup) {
+            generator.emit_save_sp();
+        }
         generator.emit_function_call_by_register(reg);
+        if (context.tail_call_unknown_jumps_by_lookup) {
+            generator.emit_return_if_sp_changed(context, func_index);
+        }
         print_link_branch();
         return true;
     };
 
-    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch]
+    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, func_index]
         (uint32_t target_func_vram, bool tail_call = false, bool indent = false)
     {
         bool call_by_lookup = false;
@@ -339,6 +398,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 return false;
             }
             print_indent();
+            const bool check_sp = !tail_call && context.tail_call_unknown_jumps_by_lookup;
+            if (check_sp) {
+                generator.emit_save_sp();
+            }
+            generator.set_tail_call(tail_call);
             if (reloc_reference_symbol != (size_t)-1) {
                 generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset);
             }
@@ -351,6 +415,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             else {
                 generator.emit_function_call(context, matched_func_index);
             }
+            generator.set_tail_call(false);
+            if (check_sp) {
+                generator.emit_return_if_sp_changed(context, func_index);
+            }
             print_link_branch();
         }
         return true;
@@ -361,7 +429,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         if (branch_target < func.vram || branch_target >= func_vram_end) {
             // If the branch target is the start of some known function, this can be handled as a tail call.
             // FIXME: how to deal with static functions?
-            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
+            // [wcw fullconv] ...or any address, when unknown jumps are lookup tail calls.
+            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end() ||
+                context.tail_call_unknown_jumps_by_lookup) {
                 fmt::print("Tail call in {} to 0x{:08X}\n", func.name, branch_target);
                 if (!print_func_call_by_address(branch_target, true, true)) {
                     return false;
@@ -423,7 +493,19 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 print_indent();
                 generator.emit_cop0_status_read(rt);
                 break;
+            case Cop0Reg::COP0_Random:
+                print_indent();
+                generator.emit_cop0_random_read(rt);
+                break;
             default:
+                // [wcw fullconv] hack mode: code a game never runs outside its exception handler / TLB setup (a
+                // stock function the static build stubs, reached by an extra entry): trap there instead of failing
+                if (context.tail_call_unknown_jumps_by_lookup) {
+                    fmt::print("[Info] Unhandled cop0 register in mfc0 ({}) at 0x{:08X} in {}: trap\n", (int)reg, instr_vram, func.name);
+                    print_indent();
+                    generator.emit_do_break(instr_vram);
+                    break;
+                }
                 fmt::print(stderr, "Unhandled cop0 register in mfc0: {}\n", (int)reg);
                 return false;
             }
@@ -438,6 +520,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_cop0_status_write(rt);
                 break;
             default:
+                // [wcw fullconv] hack mode: code a game never runs outside its exception handler / TLB setup (a
+                // stock function the static build stubs, reached by an extra entry): trap there instead of failing
+                if (context.tail_call_unknown_jumps_by_lookup) {
+                    fmt::print("[Info] Unhandled cop0 register in mtc0 ({}) at 0x{:08X} in {}: trap\n", (int)reg, instr_vram, func.name);
+                    print_indent();
+                    generator.emit_do_break(instr_vram);
+                    break;
+                }
                 fmt::print(stderr, "Unhandled cop0 register in mtc0: {}\n", (int)reg);
                 return false;
             }
@@ -518,6 +608,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 print_indent();
                 generator.emit_return(context, func_index);
             }
+            // [wcw fullconv] Unknown target: tail call through the lookup when allowed.
+            else if (context.tail_call_unknown_jumps_by_lookup) {
+                if (!print_func_call_by_address(branch_target, true)) {
+                    return false;
+                }
+                print_indent();
+                generator.emit_return(context, func_index);
+            }
             else {
                 fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}\n", func.name, instr_vram, branch_target);
                 return false;
@@ -554,6 +652,20 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
 
             fmt::print("[Info] Indirect tail call in {}\n", func.name);
+            if (context.tail_call_unknown_jumps_by_lookup) {
+                // hack code may return through a copy of ra (a token): check before the lookup
+                if (!process_delay_slot(false)) {
+                    return false;
+                }
+                print_indent();
+                generator.emit_return_if_ra_token(rs, context, func_index);
+                generator.set_tail_call(true);
+                generator.emit_function_call_by_register(rs);
+                generator.set_tail_call(false);
+                print_indent();
+                generator.emit_return(context, func_index);
+                break;
+            }
             print_func_call_by_register(rs);
             print_indent();
             generator.emit_return(context, func_index);
@@ -746,8 +858,24 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     }
 
     if (!handled) {
-        fmt::print(stderr, "Unhandled instruction: {}\n", instr.getOpcodeName());
-        return false;
+        // [wcw fullconv] In hack code (regenerated or relinked), an instruction the R4300 doesn't have is
+        // data or dead code; the hardware would raise a reserved-instruction exception: trap there instead
+        // of rejecting the whole mod.
+        // Cache maintenance (libultra's osInvalICache/osWritebackDCache loops, which static builds stub) has no
+        // effect here: nothing to emit (Revenge Starrcade 2.0 reaches osInvalICache through an extra entry).
+        if (context.tail_call_unknown_jumps_by_lookup && instr_id == InstrId::cpu_cache) {
+            handled = true;
+        }
+        else if (context.tail_call_unknown_jumps_by_lookup) {
+            fmt::print("[Info] Unhandled instruction {} at 0x{:08X} in {}: trap\n", instr.getOpcodeName(), instr_vram, func.name);
+            print_indent();
+            generator.emit_do_break(instr_vram);
+            handled = true;
+        }
+        else {
+            fmt::print(stderr, "Unhandled instruction: {}\n", instr.getOpcodeName());
+            return false;
+        }
     }
 
     // TODO is this used?
@@ -772,6 +900,9 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             "    TRACE_ENTRY()\n",
             func.name);
     }
+
+    // [wcw fullconv] Whether a branch or jump table targets the function's last word (see "runs off its end" below).
+    bool last_word_is_label = false;
 
     // Skip analysis and recompilation of this function is stubbed.
     if (!func.stubbed) {
@@ -812,8 +943,19 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         for (const auto& jtbl : stats.jump_tables) {
             jtbl_lw_instructions.insert(jtbl.lw_vram);
             for (uint32_t jtbl_entry : jtbl.entries) {
+                // [wcw fullconv] In hack mode a case outside the function gets no label: it must reach the live
+                // generator's lookup stub, and a label below the function would be placed at its first instruction
+                // (aki-roadmap#123: case 10 of func_80123674 into func_801211A0 re-entered func_80123674 instead).
+                if (context.tail_call_unknown_jumps_by_lookup &&
+                    (jtbl_entry < func.vram || jtbl_entry >= func.vram + func.words.size() * sizeof(func.words[0]))) {
+                    continue;
+                }
                 branch_labels.insert(jtbl_entry);
             }
+        }
+
+        if (!func.words.empty()) {
+            last_word_is_label = branch_labels.contains(func.vram + (uint32_t)((func.words.size() - 1) * sizeof(func.words[0])));
         }
 
         // Second pass, emit code for each instruction and emit labels
@@ -833,7 +975,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 generator.emit_goto(fmt::format("skip_{}", num_likely_branches));
             }
             // If there are any other branch labels to insert and we're at the next one, insert it
-            if (cur_label != branch_labels.end() && vram >= *cur_label) {
+            // [wcw fullconv] ...all of them: labels below the function (data words in hack code decoding as branches,
+            // tail calls back) are placed here at its start too, and one per instruction delayed every later label
+            // (VPW64 Deluxe's func_80030C5C: its `bne` to the `jr ra` landed four instructions further, in other code)
+            while (cur_label != branch_labels.end() && vram >= *cur_label) {
                 generator.emit_label(fmt::format("L_{:08X}", *cur_label));
                 ++cur_label;
             }
@@ -849,6 +994,15 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 output_file.clear();
                 return false;
             }
+            // [wcw fullconv] Name the instruction a live generator couldn't emit (its error paths are silent).
+            // (the live path calls through Generator, where has_errored is public; CGenerator inherits privately)
+            if constexpr (requires { generator.has_errored(); }) {
+                if (generator.has_errored()) {
+                    fmt::print(stderr, "[live recompiler] couldn't emit 0x{:08X}: {} (0x{:08X}) in {}\n", vram,
+                        instructions[instr_index].disassemble(0), instructions[instr_index].getRaw(), func.name);
+                    return false;
+                }
+            }
             // If a link return branch was generated, advance the number of link return branches
             if (had_link_branch) {
                 num_link_branches++;
@@ -863,6 +1017,22 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             in_likely_delay_slot = is_branch_likely;
             // Advance the vram address by the size of one instruction
             vram += 4;
+        }
+    }
+
+    // [wcw fullconv] A function that can run off its end (a hack wrote one block of code over two
+    // stock functions) continues at the next address: tail-call it through the lookup.
+    if (context.tail_call_unknown_jumps_by_lookup && !func.words.empty()) {
+        uint32_t last = byteswap(func.words[func.words.size() - 1]);
+        uint32_t prev = func.words.size() >= 2 ? byteswap(func.words[func.words.size() - 2]) : 0;
+        // ...also when a branch lands on the last word: the runtime extends a span that ends on a jump or branch by
+        // its delay slot (aki-roadmap#76), and a branch to that word (the next stock function's start) runs on from it
+        // even when the jump before it ends the flow.
+        if (N64Recomp::function_runs_off_end(func.words.size(), last, prev, last_word_is_label)) {
+            uint32_t next_vram = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
+            fmt::print("[Info] {} runs off its end: tail call to 0x{:08X}\n", func.name, next_vram);
+            generator.emit_function_call_lookup(next_vram);
+            generator.emit_return(context, func_index);
         }
     }
 

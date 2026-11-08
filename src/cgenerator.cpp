@@ -493,6 +493,13 @@ void N64Recomp::CGenerator::emit_check_nan(int fpr, bool is_double) const {
     fmt::print(output_file, "NAN_CHECK(ctx->f{}.{}); ", fpr, is_double ? "d" : "fl");
 }
 
+// [wcw fullconv] Random counts down between Wired and 31 on hardware; any value in range will do.
+void N64Recomp::CGenerator::emit_cop0_random_read(int reg) const {
+    if (reg != 0) {
+        fmt::print(output_file, "{} = (gpr)(int32_t)(((uint32_t)rand()) & 31);\n", gpr_to_string(reg));
+    }
+}
+
 void N64Recomp::CGenerator::emit_cop0_status_read(int reg) const {
     fmt::print(output_file, "{} = cop0_status_read(ctx);\n", gpr_to_string(reg));
 }

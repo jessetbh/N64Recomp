@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <unordered_map>
 #include <cmath>
@@ -49,6 +50,8 @@ struct SwitchErrorJump {
     uint32_t instr_vram;
     uint32_t jtbl_vram;
     sljit_jump* jump;
+    // [wcw fullconv] The function the switch is in (a whole batch's error jumps are emitted in finish()).
+    std::string function_name;
 };
 
 struct N64Recomp::LiveGeneratorContext {
@@ -87,6 +90,7 @@ N64Recomp::LiveGenerator::~LiveGenerator() {
 N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
     LiveGeneratorOutput ret{};
     if (errored) {
+        fprintf(stderr, "[live recompiler] not generated: an instruction couldn't be emitted (see the function named above)\n");
         ret.good = false;
         return ret;
     }
@@ -99,6 +103,8 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
 
         // Generation isn't valid if the target function wasn't recompiled.
         if (target_func_label == nullptr) {
+            fprintf(stderr, "[live recompiler] not generated: a call targets function #%zu of this batch, which wasn't recompiled\n",
+                call.target_func_index);
             return { };
         }
 
@@ -107,11 +113,19 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
 
     // Generate the switch error jump targets and assign the jump labels.
     if (!context->switch_error_jumps.empty()) {
-        // Allocate the function name and place it in the literals.
-        char* func_name = new char[context->function_name.size() + 1];
-        memcpy(func_name, context->function_name.c_str(), context->function_name.size());
-        func_name[context->function_name.size()] = '\x00';
-        ret.string_literals.emplace_back(func_name);
+        // Allocate each function name once and place it in the literals.
+        // [wcw fullconv] Per jump: context->function_name is the batch's last function by now, so every
+        // switch error named that one (aki-roadmap#123).
+        std::unordered_map<std::string, char*> func_names{};
+        auto func_name_of = [&](const std::string& name) {
+            auto [it, added] = func_names.emplace(name, nullptr);
+            if (added) {
+                it->second = new char[name.size() + 1];
+                memcpy(it->second, name.c_str(), name.size() + 1);
+                ret.string_literals.emplace_back(it->second);
+            }
+            return it->second;
+        };
 
         std::vector<sljit_jump*> switch_error_return_jumps{};
         switch_error_return_jumps.resize(context->switch_error_jumps.size());
@@ -124,7 +138,7 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
             sljit_set_label(cur_error_jump.jump, sljit_emit_label(compiler));
 
             // Load the arguments (function name, vram, jump table address)
-            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(func_name));
+            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(func_name_of(cur_error_jump.function_name)));
             sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, sljit_sw(cur_error_jump.instr_vram));
             sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(cur_error_jump.jtbl_vram));
             
@@ -149,6 +163,10 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
     // Generate the code.
     ret.code = sljit_generate_code(compiler, 0, NULL);
     ret.code_size = sljit_get_generated_code_size(compiler);
+    if (ret.code == nullptr) {
+        fprintf(stderr, "[live recompiler] not generated: sljit_generate_code failed (error %d)\n", sljit_get_compiler_error(compiler));
+        ret.good = false;
+    }
     ret.functions.resize(context->func_labels.size());
 
     // Get the function addresses.
@@ -1303,11 +1321,22 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
     }
 }
 
+// [wcw fullconv] A tail call returns from this function itself (SLJIT_CALL_RETURN), unless its return is hooked.
+int N64Recomp::LiveGenerator::call_type() const {
+    if (tail_call && inputs.return_func_hooks.find(cur_func_index) == inputs.return_func_hooks.end()) {
+        return SLJIT_CALL | SLJIT_CALL_RETURN;
+    }
+    return SLJIT_CALL;
+}
+
 void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_name, size_t func_index) const {
     context->function_name = function_name;
+    cur_func_index = func_index;
+    tail_call = false;
     context->func_labels[func_index] = sljit_emit_label(compiler);
     // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
-    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), 0);
+    // [wcw fullconv] one local word: sp saved around calls (emit_save_sp)
+    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), sizeof(sljit_sw));
     sljit_emit_op2(compiler, SLJIT_SUB, Registers::rdram, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
     
     // Check if this function's entry is hooked and emit the hook call if so.
@@ -1325,6 +1354,10 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
 void N64Recomp::LiveGenerator::emit_function_end() const {
     // Check that all jumps have been paired to a label.
     if (!context->pending_jumps.empty()) {
+        // [wcw fullconv] say which labels were jumped to but never placed
+        for (const auto& [label, jumps] : context->pending_jumps) {
+            fprintf(stderr, "[live recompiler] jump to label %s, which the function never placed\n", label.c_str());
+        }
         assert(false);
         errored = true;
     }
@@ -1338,7 +1371,17 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
         for (size_t case_index = 0; case_index < cur_labels.size(); case_index++) {
             // Find the label.
             auto find_it = context->labels.find(cur_labels[case_index]);
+            // [wcw fullconv] A case outside the function (see Context::external_code_ranges): emit a
+            // stub after the function body that tail-calls the target through the lookup.
+            if (find_it == context->labels.end() && (cur_labels[case_index].starts_with("L_") || cur_labels[case_index].starts_with("X_"))) {
+                uint32_t target = (uint32_t)std::stoul(cur_labels[case_index].substr(2), nullptr, 16);
+                sljit_label* stub = sljit_emit_label(compiler);
+                emit_function_call_lookup(target);
+                sljit_emit_return_void(compiler);
+                find_it = context->labels.emplace(cur_labels[case_index], stub).first;
+            }
             if (find_it == context->labels.end()) {
+                fprintf(stderr, "[live recompiler] switch %zu: case label %s not found\n", switch_index, cur_labels[case_index].c_str());
                 // Label not found, invalid switch.
                 // Track this in a variable instead of returning immediately so that the pending labels are still cleared.
                 invalid_switch = true;
@@ -1365,6 +1408,66 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
     }
 }
 
+void N64Recomp::LiveGenerator::emit_save_sp() const {
+    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), 0, Registers::arithmetic_temp1, 0);
+}
+
+// [wcw fullconv] Tokens standing for a copy of ra in hack code: 0x7F000000 | slot (a TLB address no game here maps),
+// the slot holding the host frame of the function that made the copy.
+static constexpr uint32_t ra_token_base = 0x7F000000;
+static thread_local void* ra_token_frames[4096];
+static thread_local uint32_t ra_token_next = 0;
+
+static int32_t make_ra_token(void* frame) {
+    uint32_t slot = ra_token_next++ & 4095;
+    ra_token_frames[slot] = frame;
+    return int32_t(ra_token_base | slot);
+}
+
+// A jump to a token: unwind to the frame that made it (none when it's this one) and return.
+static int32_t check_ra_token(uint32_t value, void* frame, recomp_context* ctx) {
+    if ((value & 0xFFFFF000) != ra_token_base) {
+        return 0;
+    }
+    void* target = ra_token_frames[value & 4095];
+    ctx->unwind_frame = target == frame ? nullptr : target;
+    return 1;
+}
+
+void N64Recomp::LiveGenerator::emit_return_if_sp_changed(const Context& context, size_t func_index) const {
+    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
+    sljit_jump* same = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_MEM1(SLJIT_SP), 0);
+    emit_return(context, func_index);
+    sljit_set_label(same, sljit_emit_label(compiler));
+    // a non-local return through a ra token is under way: return; the frame it names stops it
+    sljit_emit_op1(compiler, SLJIT_MOV_P, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, unwind_frame));
+    sljit_jump* none = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_IMM, 0);
+    sljit_get_local_base(compiler, Registers::arithmetic_temp2, 0, 0);
+    sljit_jump* other = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp2, 0);
+    sljit_emit_op1(compiler, SLJIT_MOV_P, SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, unwind_frame), SLJIT_IMM, 0);
+    sljit_set_label(other, sljit_emit_label(compiler));
+    emit_return(context, func_index);
+    sljit_set_label(none, sljit_emit_label(compiler));
+}
+
+void N64Recomp::LiveGenerator::emit_ra_token(int reg) const {
+    sljit_get_local_base(compiler, SLJIT_R0, 0, 0);
+    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS1(32, P), SLJIT_IMM, sljit_sw(make_ra_token));
+    sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_R1, 0, SLJIT_RETURN_REG, 0);
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_R1, 0);
+}
+
+void N64Recomp::LiveGenerator::emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const {
+    sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg));
+    sljit_get_local_base(compiler, SLJIT_R1, 0, 0);
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, Registers::ctx, 0);
+    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3(32, 32, P, P), SLJIT_IMM, sljit_sw(check_ra_token));
+    sljit_jump* plain = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_RETURN_REG, 0, SLJIT_IMM, 0);
+    emit_return(context, func_index);
+    sljit_set_label(plain, sljit_emit_label(compiler));
+}
+
 void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
     // Load the address immediate into the first argument. 
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, int32_t(addr));
@@ -1380,7 +1483,7 @@ void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
 
     // Call the function.
-    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+    sljit_emit_icall(compiler, call_type(), SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
 }
 
 void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
@@ -1398,7 +1501,7 @@ void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
 
     // Call the function.
-    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+    sljit_emit_icall(compiler, call_type(), SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
 }
 
 void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context&, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
@@ -1432,7 +1535,7 @@ void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t functio
     sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
     // Call the function and save the jump to set its label later on.
-    sljit_jump* call_jump = sljit_emit_call(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P));
+    sljit_jump* call_jump = sljit_emit_call(compiler, call_type(), SLJIT_ARGS2V(P, P));
     context->inner_calls.emplace_back(InnerCall{ .target_func_index = function_index, .jump = call_jump });
 }
 
@@ -1590,8 +1693,15 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
     // Populate the switch's labels.
     std::vector<std::string> cur_labels{};
     cur_labels.resize(jtbl.entries.size());
+    // [wcw fullconv] A case outside the function is named X_ so it always gets the lookup stub in
+    // emit_function_end: an L_ label of the same address (a branch out of the function) may have been placed
+    // at the function's start, and the case would re-enter the function (aki-roadmap#123).
+    const Function& func = recompiler_context.functions[cur_func_index];
+    const uint32_t func_end = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
     for (size_t i = 0; i < cur_labels.size(); i++) {
-        cur_labels[i] = fmt::format("L_{:08X}", jtbl.entries[i]);
+        const bool outside = recompiler_context.tail_call_unknown_jumps_by_lookup &&
+            (jtbl.entries[i] < func.vram || jtbl.entries[i] >= func_end);
+        cur_labels[i] = fmt::format("{}_{:08X}", outside ? "X" : "L", jtbl.entries[i]);
     }
     context->switch_jump_labels.emplace_back(std::move(cur_labels));
 
@@ -1633,7 +1743,8 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
     
     // Bounds check the addend. If it's greater than or equal to the jump table size (entries * sizeof(u32)) then jump to the switch error.
     sljit_jump* switch_error_jump = sljit_emit_cmp(compiler, SLJIT_GREATER_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_IMM, jtbl.entries.size() * sizeof(uint32_t));
-    context->switch_error_jumps.emplace_back(SwitchErrorJump{.instr_vram = jtbl.jr_vram, .jtbl_vram = jtbl.vram, .jump = switch_error_jump});
+    context->switch_error_jumps.emplace_back(SwitchErrorJump{.instr_vram = jtbl.jr_vram, .jtbl_vram = jtbl.vram, .jump = switch_error_jump,
+        .function_name = context->function_name});
 
     // Multiply the jump table addend by 2 to get the addend for the real jump table. (4 bytes per entry to 8 bytes per entry).
     sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0);
@@ -1689,6 +1800,20 @@ void N64Recomp::LiveGenerator::emit_check_nan(int fpr, bool is_double) const {
     (void)fpr;
     (void)is_double;
     // Nothing to do here.
+}
+
+// [wcw fullconv] COP0 Random: a cheap pseudo-random value in the register's range (0-31).
+static int64_t live_cop0_random_read() {
+    static uint32_t state = 0x2545F491u;
+    state = state * 1664525u + 1013904223u;
+    return (int64_t)(int32_t)((state >> 16) & 31);
+}
+
+void N64Recomp::LiveGenerator::emit_cop0_random_read(int reg) const {
+    if (reg != 0) {
+        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS0(W), SLJIT_IMM, sljit_sw(live_cop0_random_read));
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_RETURN_REG, 0);
+    }
 }
 
 void N64Recomp::LiveGenerator::emit_cop0_status_read(int reg) const {
