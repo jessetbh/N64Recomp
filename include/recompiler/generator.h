@@ -27,6 +27,20 @@ namespace N64Recomp {
 
     class Generator {
     public:
+        // [wcw fullconv] An emit failed (the live generator); lets the recompiler name the instruction.
+        virtual bool has_errored() const { return false; }
+        // [wcw fullconv] Hack code: a callee that pops its caller's frame (a non-local return, Giant Series 64's
+        // decompressor subroutines branch into its epilogue) returned to the caller's caller on the hardware. Around
+        // a call: save sp, and return too when the callee changed it. Only the live generator emits these.
+        virtual void emit_save_sp() const {}
+        virtual void emit_return_if_sp_changed(const Context& context, size_t func_index) const { (void)context; (void)func_index; }
+        // ...and through a copy of ra (VPW64 Deluxe's decompressor: `move t9, ra` on entry, `jr t9` from another
+        // function's code): the copy is a token naming this frame; a jump to a token returns to that frame's caller.
+        virtual void emit_ra_token(int reg) const { (void)reg; }
+        // The calls emitted until set_tail_call(false) are tail calls (the function returns right after): the live
+        // generator makes them real ones, so code looping through jumps between functions doesn't grow the stack.
+        virtual void set_tail_call(bool tail) const { (void)tail; }
+        virtual void emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const { (void)reg; (void)context; (void)func_index; }
         virtual void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const = 0;
         virtual void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const = 0;
         virtual void process_store_op(const StoreOp& op, const InstructionContext& ctx) const = 0;
@@ -52,6 +66,8 @@ namespace N64Recomp {
         virtual void emit_check_fr(int fpr) const = 0;
         virtual void emit_check_nan(int fpr, bool is_double) const = 0;
         virtual void emit_cop0_status_read(int reg) const = 0;
+        // [wcw fullconv] COP0 Random (ROM hacks use it as a cheap random number).
+        virtual void emit_cop0_random_read(int reg) const = 0;
         virtual void emit_cop0_status_write(int reg) const = 0;
         virtual void emit_cop1_cs_read(int reg) const = 0;
         virtual void emit_cop1_cs_write(int reg) const = 0;
@@ -89,6 +105,7 @@ namespace N64Recomp {
         void emit_check_fr(int fpr) const final;
         void emit_check_nan(int fpr, bool is_double) const final;
         void emit_cop0_status_read(int reg) const final;
+        void emit_cop0_random_read(int reg) const final;
         void emit_cop0_status_write(int reg) const final;
         void emit_cop1_cs_read(int reg) const final;
         void emit_cop1_cs_write(int reg) const final;
@@ -98,6 +115,11 @@ namespace N64Recomp {
         void emit_pause_self() const final;
         void emit_trigger_event(uint32_t event_index) const final;
         void emit_comment(const std::string& comment) const final;
+        void emit_save_sp() const final {}
+        void emit_return_if_sp_changed(const Context&, size_t) const final {}
+        void emit_ra_token(int) const final {}
+        void set_tail_call(bool) const final {}
+        void emit_return_if_ra_token(int, const Context&, size_t) const final {}
     private:
         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
